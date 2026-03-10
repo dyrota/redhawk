@@ -1,0 +1,754 @@
+# Redhawk — AI Agent Build Specification
+
+**Electronic Life Insurance Application Platform**
+
+| | |
+|---|---|
+| **Project** | Redhawk |
+| **Document Type** | AI Agent Implementation Specification |
+| **Primary Stack** | Blazor WASM, .NET 10, Azure AI Foundry, Microsoft RulesEngine, SQLite WASM |
+| **Target** | Agent-facing PWA (online + offline) |
+| **Version** | 1.0 — Proof of Concept Scope |
+
+This document provides complete technical context for an AI coding agent to build the Redhawk system. It covers architecture, data contracts, processing loops, service interfaces, Fluxor state shape, SQLite local storage, Azure AI Foundry prompt flow design, and build order. Follow the build order in Section 9 to progress incrementally with a demoable system at each step.
+
+---
+
+## 1. System Overview
+
+Redhawk is an agent-facing Progressive Web Application built with Blazor WebAssembly that allows insurance agents to complete life insurance applications with customers. The system operates in two modes:
+
+| Mode | Capabilities |
+|---|---|
+| **Online** | Full AI voice assistant (Azure Speech STT/TTS + Azure AI Foundry extraction), rules engine runs client-side from SQLite, completed applications sync to backend. |
+| **Offline** | Rules engine operates fully client-side from SQLite. Manual form entry only. State persists in SQLite and syncs when connectivity is restored. |
+
+### 1.1 Three-Consumer State Model
+
+All system behavior derives from a single shared JSON state document. Three consumers read and write it through controlled mutation paths:
+
+| Consumer | Role | Availability |
+|---|---|---|
+| **Rules Engine** | Reads full state. Outputs NavigationResult (next question + relevant context + skipped questions). | Always |
+| **AI Assistant** | Reads only the relevant context slice the rules engine selects — never full state. Writes FieldPatchProposal. | Online only |
+| **Blazor UI** | Reads full state via Fluxor store. Renders bound form fields reactively. | Always |
+
+### 1.2 Key Architectural Constraints
+
+- Rules engine MUST run client-side (Blazor WASM) to support offline operation
+- AI assistant is additive — removing it must not break form functionality
+- All state mutations flow through Fluxor actions — no direct field writes
+- Customer PII in SQLite must be encrypted at rest using Web Crypto API
+- Application submission is final — no post-submission edits in this version
+- Agents may have multiple in-progress applications simultaneously
+- Rules are stored in SQLite and fully synced on login — offline operation requires no network
+
+---
+
+## 2. The Application State Document
+
+This is the central data contract. Every service, component, and processing loop references this schema. Stored as an encrypted JSON blob in the SQLite `Applications` table.
+
+### 2.1 Full Schema
+
+```json
+{
+  "meta": {
+    "applicationId": "uuid-v4",
+    "productType": "TermLife | WholeLife | Annuity",
+    "schemaVersion": 1,
+    "rulesVersion": 14,
+    "status": "InProgress | Submitted",
+    "createdAt": "ISO8601",
+    "lastModified": "ISO8601",
+    "agentId": "entra-object-id",
+    "currentQuestionId": "tobacco_use",
+    "completedSections": ["personal_info"],
+    "skippedQuestions": ["tobacco_detail_type"],
+    "completionPercent": 34
+  },
+  "applicant": {
+    "firstName": "John",
+    "lastName": null,
+    "dateOfBirth": null,
+    "tobaccoUse": false,
+    "tobaccoProductType": null,
+    "occupation": null,
+    "annualIncome": null,
+    "stateOfResidence": null
+  },
+  "coverage": {
+    "requestedAmount": null,
+    "termLength": null
+  },
+  "beneficiaries": [],
+  "healthHistory": {
+    "conditions": [],
+    "medications": []
+  },
+  "conversation": [
+    { "role": "assistant", "content": "...", "timestamp": "ISO8601", "type": "question | clarification | summary" },
+    { "role": "user", "content": "...", "timestamp": "ISO8601", "source": "voice | text" }
+  ],
+  "fieldAudit": {
+    "applicant.firstName": { "source": "ai_extraction | manual | agent_voice", "timestamp": "ISO8601", "confidence": "high | low" }
+  },
+  "validation": {
+    "errors": [],
+    "warnings": []
+  }
+}
+```
+
+### 2.2 Field Audit Trail
+
+Every field write must record source, timestamp, and confidence in `fieldAudit`. This is required for insurance compliance. Source values:
+
+- `ai_extraction` — populated by AI from voice utterance
+- `agent_voice` — agent spoke the answer, AI extracted it
+- `manual` — agent typed directly into form field
+
+### 2.3 Null vs Missing
+
+Use `null` explicitly for unanswered questions. Never use empty string or omit the field. The rules engine distinguishes between `null` (not yet answered) and `false` (answered negative) for navigation decisions.
+
+---
+
+## 3. Rules Engine — Microsoft RulesEngine
+
+Microsoft.RulesEngine NuGet package. Runs in Blazor WASM (fully client-side). Rules are loaded from SQLite on app start. SQLite is fully synced from the server on agent login and re-synced whenever a version mismatch is detected on reconnect.
+
+### 3.1 NavigationResult — The Rules Engine Output Contract
+
+```csharp
+public class NavigationResult
+{
+    public Question NextQuestion { get; set; }                       // null = application complete
+    public Dictionary<string, object> RelevantContext { get; set; }  // AI context slice
+    public List<string> SkippedQuestions { get; set; }               // questions bypassed this evaluation
+    public List<FieldPatch> EagerPatches { get; set; }               // pre-extracted future answers to apply
+    public bool IsComplete { get; set; }
+    public List<ValidationError> ValidationErrors { get; set; }
+}
+```
+
+### 3.2 Question Definition
+
+```csharp
+public class Question
+{
+    public string Id { get; set; }
+    public string Prompt { get; set; }
+    public string FieldPath { get; set; }                // dot-notation path into state doc
+    public FieldType Type { get; set; }                  // Boolean, Date, String, Enum, Currency
+    public List<string> EnumValues { get; set; }         // populated for Type == Enum
+    public string NavigationRule { get; set; }           // RulesEngine rule name — must pass to show
+    public string ValidationRule { get; set; }           // RulesEngine rule name — must pass to advance
+    public List<ContextRule> ContextRules { get; set; }  // dynamic AI context selection
+    public int DisplayOrder { get; set; }
+    public string SectionId { get; set; }
+    public int ConversationWindowSize { get; set; } = 5;
+}
+
+public class ContextRule
+{
+    public string Expression { get; set; }       // evaluated against state — 'true' always includes
+    public string IncludeFieldPath { get; set; }
+}
+```
+
+### 3.3 Rule Layers
+
+| Layer | Purpose | Example |
+|---|---|---|
+| **Atomic** | Single-concern, reusable | IsAdult, IsSmoker, HighRiskOccupation |
+| **Composite** | Assembled from atomics, per-product | TermLifeEligible = IsAdult + !HighRisk |
+| **Navigation** | Drive question sequencing | AskTobaccoFollowUp = tobaccoUse == true && tobaccoProductType == null |
+
+### 3.4 IRulesEngineService Interface
+
+```csharp
+public interface IRulesEngineService
+{
+    Task<NavigationResult> EvaluateAsync(ApplicationStateDocument state);
+    Task LoadWorkflowAsync(string productType);  // loads from SQLite
+    bool IsLoaded { get; }
+    int LoadedVersion { get; }
+}
+```
+
+### 3.5 Navigation Loop (Pseudocode)
+
+```csharp
+foreach (var question in orderedQuestionGraph)
+{
+    if (state already has non-null answer for question.FieldPath) continue;
+
+    var navigationPasses = await rulesEngine.EvaluateRuleAsync(question.NavigationRule, state);
+    if (!navigationPasses) { result.SkippedQuestions.Add(question.Id); continue; }
+
+    // Build RelevantContext from ContextRules
+    result.RelevantContext = question.ContextRules
+        .Where(cr => Evaluate(cr.Expression, state))
+        .ToDictionary(cr => cr.IncludeFieldPath, cr => GetFieldValue(state, cr.IncludeFieldPath));
+
+    result.NextQuestion = question;
+    break;
+}
+```
+
+---
+
+## 4. SQLite Local Storage
+
+SQLite WASM with OPFS (Origin Private File System) backend replaces IndexedDB entirely. EF Core 10 with `Microsoft.EntityFrameworkCore.Sqlite` provides the data access layer. The SQLite file persists across browser sessions as part of the app's private OPFS storage — it is not part of the compiled PWA bundle and survives app updates cleanly.
+
+### 4.1 Database Schema
+
+```sql
+CREATE TABLE RulesBundles (
+    ProductType     TEXT PRIMARY KEY,
+    Version         INTEGER NOT NULL,
+    WorkflowJson    TEXT NOT NULL,
+    QuestionGraph   TEXT NOT NULL,
+    SyncedAt        TEXT NOT NULL
+);
+
+CREATE TABLE Applications (
+    Id              TEXT PRIMARY KEY,
+    AgentId         TEXT NOT NULL,
+    ProductType     TEXT NOT NULL,
+    CustomerName    TEXT NOT NULL,
+    Status          TEXT NOT NULL,   -- InProgress | PendingSync | Submitted
+    LastModified    TEXT NOT NULL,
+    StateDocument   TEXT NOT NULL,   -- encrypted JSON blob
+    RulesVersion    INTEGER NOT NULL
+);
+
+CREATE TABLE SyncQueue (
+    ApplicationId   TEXT PRIMARY KEY,
+    QueuedAt        TEXT NOT NULL,
+    RetryCount      INTEGER DEFAULT 0
+);
+
+CREATE INDEX IX_Applications_Agent ON Applications (AgentId, Status);
+```
+
+### 4.2 EF Core Setup
+
+```csharp
+// Program.cs
+builder.Services.AddDbContext<RedhawkDbContext>(options =>
+    options.UseSqlite("Data Source=redhawk.db"));  // OPFS handles the file
+
+// App startup — after auth, before routing
+await using var scope = app.Services.CreateAsyncScope();
+var db = scope.ServiceProvider.GetRequiredService<RedhawkDbContext>();
+await db.Database.MigrateAsync();  // creates/updates schema on first run
+```
+
+### 4.3 Required HTTP Headers
+
+SQLite WASM depends on `SharedArrayBuffer`, which requires these headers on the hosting server. Missing them produces a cryptic runtime error:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+### 4.4 Storage Separation
+
+```
+PWA Bundle (deployed, versioned)     SQLite in OPFS (runtime, mutable)
+─────────────────────────────────    ──────────────────────────────────
+Blazor runtime                       RulesBundles table
+Compiled assemblies                  Applications table
+App shell / manifest                 SyncQueue table
+                                     Agent preferences
+```
+
+Deploying a new version of the app never wipes SQLite data. EF Core migrations handle schema changes without touching content rows.
+
+### 4.5 Encryption at Rest
+
+State documents contain customer PII and must be encrypted before writing to SQLite. Use the Web Crypto API with AES-GCM. Derive the encryption key from the agent's MSAL access token on login. The key lives in memory only — session expiry requires re-authentication to read encrypted data.
+
+```javascript
+// Key derivation (JS interop, called on login)
+const keyMaterial = await crypto.subtle.importKey('raw', tokenBytes, 'PBKDF2', false, ['deriveKey']);
+const encryptionKey = await crypto.subtle.deriveKey(
+  { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+  keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+);
+```
+
+---
+
+## 5. Rules Sync
+
+Rules are stored in the server database and fully synced into the client SQLite on login. Offline operation reads entirely from SQLite — no network calls are made for rules at runtime.
+
+### 5.1 Sync API Endpoints
+
+```
+GET /api/rules/versions
+→ [
+    { "productType": "TermLife", "version": 14 },
+    { "productType": "WholeLife", "version": 7 }
+  ]
+
+GET /api/rules/all
+→ [
+    { "productType": "TermLife", "version": 14, "workflowJson": "...", "questionGraph": "..." },
+    { "productType": "WholeLife", "version": 7,  "workflowJson": "...", "questionGraph": "..." }
+  ]
+```
+
+### 5.2 IRulesSyncService Interface
+
+```csharp
+public interface IRulesSyncService
+{
+    Task SyncOnLoginAsync();       // always fetch full rules bundle on login
+    Task CheckAndSyncAsync();      // on reconnect — fetch if any version is stale
+    bool IsAvailable { get; }      // false when offline
+}
+```
+
+### 5.3 Sync Implementation
+
+```csharp
+public class RulesSyncService : IRulesSyncService
+{
+    public async Task SyncOnLoginAsync()
+    {
+        var bundles = await _api.GetAsync<List<RulesBundle>>("/api/rules/all");
+
+        await _db.Database.ExecuteSqlRawAsync("DELETE FROM RulesBundles");
+
+        foreach (var bundle in bundles)
+        {
+            await _db.RulesBundles.AddAsync(new RulesBundleEntity
+            {
+                ProductType   = bundle.ProductType,
+                Version       = bundle.Version,
+                WorkflowJson  = bundle.WorkflowJson,
+                QuestionGraph = bundle.QuestionGraph,
+                SyncedAt      = DateTime.UtcNow.ToString("O")
+            });
+        }
+
+        await _db.SaveChangesAsync();
+    }
+
+    public async Task CheckAndSyncAsync()
+    {
+        var serverVersions = await _api.GetAsync<List<RulesVersion>>("/api/rules/versions");
+
+        var needsSync = serverVersions.Any(sv =>
+            _db.RulesBundles
+               .FirstOrDefault(r => r.ProductType == sv.ProductType)
+               ?.Version != sv.Version);
+
+        if (needsSync) await SyncOnLoginAsync();
+    }
+}
+```
+
+### 5.4 Sync Trigger Points
+
+| Trigger | Action |
+|---|---|
+| Agent logs in (online) | `SyncOnLoginAsync()` — always |
+| App regains connectivity | `CheckAndSyncAsync()` — only if stale |
+| Agent opens application | Read from SQLite — no network |
+
+### 5.5 Session-Boundary Rule Updates
+
+New rules take effect when the agent starts a new application, not mid-session. An in-progress application continues using the rules version it was started with (stored in `Applications.RulesVersion`). This prevents navigation rules from shifting under an active form.
+
+---
+
+## 6. Fluxor State Store
+
+Use Fluxor (Redux pattern for Blazor). All state mutations — AI patches, rules engine navigation, and manual edits — dispatch through Fluxor actions. No component writes state directly.
+
+### 6.1 State Shape
+
+```csharp
+public record AgentState
+{
+    public string AgentId { get; init; }
+    public string DisplayName { get; init; }
+    public string Email { get; init; }
+}
+
+public record ApplicationsState
+{
+    public string ActiveApplicationId { get; init; }
+    public ImmutableDictionary<string, ApplicationEntry> Applications { get; init; }
+}
+
+public record ApplicationEntry
+{
+    public ApplicationStateDocument Document { get; init; }
+    public NavigationResult CurrentNavigation { get; init; }
+    public SyncStatus SyncStatus { get; init; }    // Local | PendingSync | Synced
+    public ImmutableStack<ApplicationStateDocument> UndoStack { get; init; }  // max depth 5
+    public DateTimeOffset LastModified { get; init; }
+}
+
+public record UIState
+{
+    public bool IsListening { get; init; }
+    public bool IsProcessing { get; init; }
+    public string TranscriptBuffer { get; init; }
+    public ImmutableList<TranscriptEntry> ConversationDisplay { get; init; }
+}
+```
+
+### 6.2 Actions
+
+```csharp
+// AI returns field patches
+public record ApplyFieldPatchesAction(string ApplicationId, List<FieldPatch> Patches);
+
+// Rules engine returns next navigation state
+public record NavigationUpdatedAction(string ApplicationId, NavigationResult Result);
+
+// Agent manually edits an already-answered field
+public record ManualFieldEditAction(string ApplicationId, string FieldPath, object Value);
+
+// Undo last patch
+public record UndoLastPatchAction(string ApplicationId);
+
+// Application lifecycle
+public record CreateApplicationAction(string ProductType, CustomerInfo Customer);
+public record SaveApplicationAction(string ApplicationId);
+public record LoadApplicationAction(string ApplicationId);
+public record SubmitApplicationAction(string ApplicationId);
+
+// Speech pipeline
+public record SetListeningAction(bool IsListening);
+public record SetProcessingAction(bool IsProcessing);
+public record AppendTranscriptAction(TranscriptEntry Entry);
+```
+
+### 6.3 Effect: ApplyFieldPatches → NavigationUpdated
+
+```csharp
+[EffectMethod]
+public async Task HandleApplyPatches(ApplyFieldPatchesAction action, IDispatcher dispatcher)
+{
+    var entry = _store.State.Applications.Applications[action.ApplicationId];
+
+    // Validate patches before applying
+    var validPatches = action.Patches
+        .Where(p => _patchValidator.Validate(p, GetQuestion(p.FieldPath)))
+        .ToList();
+
+    var updatedDoc = ApplyPatches(entry.Document, validPatches);
+    var navigation = await _rulesEngine.EvaluateAsync(updatedDoc);
+
+    dispatcher.Dispatch(new NavigationUpdatedAction(action.ApplicationId, navigation));
+
+    // Debounced — coalesces rapid writes into single SQLite save
+    _debouncedSave.Schedule(() => _storage.SaveAsync(action.ApplicationId, updatedDoc));
+}
+```
+
+### 6.4 Undo Reducer
+
+```csharp
+public static ApplicationsState Reduce(ApplicationsState state, UndoLastPatchAction action)
+{
+    var entry = state.Applications[action.ApplicationId];
+    if (entry.UndoStack.IsEmpty) return state;
+
+    var previous = entry.UndoStack.Peek();
+    return state with
+    {
+        Applications = state.Applications.SetItem(
+            action.ApplicationId,
+            entry with
+            {
+                Document  = previous,
+                UndoStack = entry.UndoStack.Pop()
+            })
+    };
+}
+```
+
+---
+
+## 7. Azure AI Foundry — Prompt Flow
+
+The PWA calls a single Prompt Flow endpoint, never the model directly. The flow owns all LLM interaction, context assembly, and response shaping. Model: GPT-4o. Temperature: 0.1.
+
+### 7.1 AI Context Envelope (PWA → Foundry)
+
+The PWA sends a lean envelope — never the full state document:
+
+```json
+{
+  "currentQuestion": {
+    "id": "tobacco_use",
+    "prompt": "Have you used tobacco or nicotine in the last 12 months?",
+    "fieldPath": "applicant.tobaccoUse",
+    "fieldType": "boolean",
+    "enumValues": null,
+    "constraints": null
+  },
+  "relevantContext": {
+    "applicant.firstName": "John",
+    "applicant.age": 34
+  },
+  "conversationHistory": [
+    { "role": "assistant", "content": "...", "timestamp": "..." },
+    { "role": "user", "content": "No I dont smoke", "timestamp": "..." }
+  ],
+  "userUtterance": "No I dont smoke"
+}
+```
+
+### 7.2 FieldPatchProposal (Foundry → PWA)
+
+```json
+{
+  "fieldUpdates": [
+    {
+      "fieldPath": "applicant.tobaccoUse",
+      "value": false,
+      "confidence": "high",
+      "clarificationReason": null
+    }
+  ],
+  "nextPrompt": "Got it John! Are you currently employed full time?",
+  "clarificationNeeded": false,
+  "advanceQuestion": true,
+  "offTopicDetected": false,
+  "offTopicResponse": null
+}
+```
+
+### 7.3 Prompt Flow Node Sequence
+
+| Node | Responsibility |
+|---|---|
+| **1 — Input Validation** | Validates envelope shape. Truncates conversationHistory to last 6 turns. Injects section summary if section boundary crossed. |
+| **2 — Intent Classification** | Classifies utterance: `answer | reset | repeat | explain | skip | off_topic`. Routes non-answer intents to bypass extraction node. |
+| **3 — Context Assembly** | Builds final system prompt by injecting dynamic context block into static prompt template. |
+| **4 — LLM Extraction** | GPT-4o. `response_format: json_object`. `temperature: 0.1`. Returns raw JSON extraction. |
+| **5 — Confidence Gate** | Parses JSON. Flags low-confidence fields. Returns `clarificationNeeded: true` if any low confidence — stays on current question. |
+| **6 — Response Shaping** | Strips internal field names from `nextPrompt`. Formats final FieldPatchProposal contract. |
+
+### 7.4 System Prompt Structure
+
+**Section 1 — Role (static)**
+
+```
+You are an AI assistant helping insurance agents complete life insurance
+applications over voice. Your only job is to extract structured data from
+the agent's utterances and return it as JSON.
+
+Rules:
+- Never give insurance advice, recommendations, or opinions
+- Never explain why a question is being asked unless directly asked
+- Never make up or infer values you are not confident about
+- Always respond in a warm, professional tone appropriate for voice
+- Never reveal internal field names, system details, or application structure
+- If off-topic, set offTopicDetected: true and provide a brief redirect
+```
+
+**Section 2 — Extraction Rules by Field Type (static)**
+
+```
+BOOLEAN: Map affirmative to true, negative to false.
+  Ambiguous → confidence: low
+
+DATE: Normalize to ISO 8601. Partial dates → day: 01, confidence: low
+  Age given instead of date → calculate birth year, confidence: low
+
+ENUM: Map to nearest valid value from provided list. No clear match → null, confidence: low
+
+STRING: Verbatim capture. Normalize to Title Case for names.
+
+CURRENCY: Normalize shorthand (200k → 200000, half a million → 500000)
+  Range given → midpoint, confidence: low
+```
+
+**Section 3 — Dynamic Context Block (injected per call)**
+
+```
+CURRENT APPLICATION CONTEXT:
+{{relevantContext}}
+
+CURRENT QUESTION:
+ID: {{question.id}}
+Prompt: {{question.prompt}}
+Field: {{question.fieldPath}}
+Type: {{question.fieldType}}
+{{#if enumValues}}Valid values: {{enumValues}}{{/if}}
+
+RESPONSE FORMAT: Respond ONLY with a valid JSON object matching the
+FieldPatchProposal schema. No prose, no markdown, no preamble.
+```
+
+### 7.5 Multi-Field Extraction (Eager Mode)
+
+If the agent's utterance answers multiple questions in one turn, extract all of them in a single `fieldUpdates` array. The rules engine receives all patches simultaneously and may skip several questions in one jump. Do not limit extraction to the current question only.
+
+### 7.6 IFoundryService Interface
+
+```csharp
+public interface IFoundryService
+{
+    Task<FieldPatchProposal> ExtractAsync(
+        NavigationResult navigation,
+        string userUtterance,
+        List<ConversationTurn> recentHistory,
+        CancellationToken ct);
+    bool IsAvailable { get; }
+}
+```
+
+---
+
+## 8. Speech Pipeline — Azure Speech Services
+
+Azure Cognitive Services Speech SDK for both STT and TTS in online mode. Graceful degradation to text-only input offline. The speech pipeline is entirely decoupled from the AI extraction loop — it produces a string transcript passed to `IFoundryService`.
+
+### 8.1 ISpeechService Interface
+
+```csharp
+public interface ISpeechService
+{
+    Task<string> ListenAsync(CancellationToken ct);
+    Task SpeakAsync(string text, CancellationToken ct);
+    bool IsAvailable { get; }
+    event EventHandler<string> OnInterimTranscript;
+}
+```
+
+### 8.2 Online Voice Loop
+
+```
+1.  Agent presses mic button → UIState.IsListening = true
+2.  ISpeechService.ListenAsync() → Azure STT → transcript string
+3.  UIState.IsListening = false, UIState.IsProcessing = true
+4.  Dispatch AppendTranscriptAction({ role: 'user', content: transcript })
+5.  IFoundryService.ExtractAsync(currentNavigation, transcript, history)  [3s timeout]
+6.  On timeout → surface manual input, log warning, set IsProcessing = false
+7.  On success → Dispatch ApplyFieldPatchesAction(patches)
+8.  Effect triggers NavigationUpdatedAction
+9.  ISpeechService.SpeakAsync(fieldPatchProposal.nextPrompt)
+10. UIState.IsProcessing = false
+```
+
+---
+
+## 9. Prototype Considerations
+
+The following improvements are included in the 2-week proof of concept scope. Each prevents a meaningful problem during the build or demo.
+
+### 9.1 Implement During Prototype (~4-5 hours total)
+
+| Item | Effort | Detail |
+|---|---|---|
+| **Patch Validation Layer** | ~1 hour | Validates AI-returned field values match expected types before writing to state. Prevents silent state corruption. |
+| **schemaVersion Field** | 5 min | `schemaVersion: 1` in state document. No migration logic needed now — makes future migrations possible. |
+| **AI Timeout + Fallback** | ~30 min | 3-second timeout on Foundry calls. On timeout, surface manual input. Agents must always be able to continue. |
+| **SQLite Write Debounce** | ~30 min | Coalesce rapid state mutations into a single 500ms debounced write. Prevents excessive storage churn. |
+| **Structured Logging** | ~20 min | Console log AI extraction results, rule evaluations, and navigation decisions in consistent format. |
+| **Undo Last Answer** | ~1-2 hours | Shallow undo stack (last 5 states) in Fluxor. Allows agents to correct mis-spoken answers instantly. |
+| **Developer Debug Panel** | ~1 hour | Toggle with `?debug=true`. Shows current question, last AI result, NavigationResult. Hidden in production. |
+
+### 9.2 Patch Validator Implementation
+
+```csharp
+public class FieldPatchValidator
+{
+    public bool Validate(FieldPatch patch, Question question)
+    {
+        if (patch.FieldPath != question.FieldPath) return false;
+
+        return question.Type switch
+        {
+            FieldType.Boolean  => patch.Value is bool,
+            FieldType.Currency => patch.Value is decimal or int,
+            FieldType.Date     => patch.Value is DateTime,
+            FieldType.Enum     => question.EnumValues?.Contains(patch.Value?.ToString()) ?? false,
+            _                  => true
+        };
+    }
+}
+```
+
+### 9.3 Deferred to Production
+
+| Feature | Reason Deferred |
+|---|---|
+| Event Log / Timeline | Per-session audit timeline. Useful for analytics, not needed for POC. |
+| Multi-Device Sync Conflict Resolution | Unlikely scenario in a single-agent prototype demo. |
+| Rule Dependency Graph Optimization | Question graph small enough that full evaluation is fast. |
+| Streaming STT | Adds integration complexity. Request-response STT sufficient for POC. |
+| Prompt Injection / Guardrail Layer | Important in production. Risk negligible for internal prototype. |
+| AI Section Summaries | Nice UX improvement, not demo-critical. |
+
+---
+
+## 10. Build Order
+
+Each step produces a demoable system. Do not skip steps or combine them. Prototype items from Section 9 are noted inline.
+
+| Step | Deliverable |
+|---|---|
+| **Step 1** | Auth + Dashboard Shell. Entra ID login with MSAL.js. Blazor WASM project with Fluxor. SQLite + EF Core wired up with OPFS backend. Schema migration runs on startup. `SyncOnLoginAsync()` fetches all rules bundles into SQLite. Agent can create, open, delete applications. Add `schemaVersion: 1` to state document. |
+| **Step 2** | State Document + Manual Form. Fluxor store fully wired. Question renderer bound to state. Manual field input dispatches `ManualFieldEditAction`. Undo stack implemented. SQLite write debounce added to storage effect. Rules engine loads from SQLite. Progressive reveal UI working. |
+| **Step 3** | Rules Engine Navigation. `IRulesEngineService` implemented with Microsoft.RulesEngine. Navigation loop evaluates full state. NextQuestion drives form progression. Skip logic working. Structured console logging added. Developer debug panel wired up. |
+| **Step 4** | Foundry Text Extraction. `IFoundryService` implemented with 3-second timeout and manual fallback. `FieldPatchValidator` added to patch application pipeline. Text input sends to Foundry. Multi-field eager extraction working. |
+| **Step 5** | Azure Speech STT/TTS. `ISpeechService` wraps Azure Speech SDK. Mic button in UI. Voice loop end-to-end. Interim transcript display. Graceful offline degradation. |
+| **Step 6** | Encryption + Rules Sync. Web Crypto API encryption of SQLite state documents. `CheckAndSyncAsync()` on reconnect. Application sync queue for submitted applications. Session-boundary rule versioning enforced. |
+
+---
+
+## 11. NuGet & NPM Dependencies
+
+| Package | Source | Purpose |
+|---|---|---|
+| Microsoft.RulesEngine | NuGet | Client-side rules evaluation in Blazor WASM |
+| Fluxor.Blazor.Web | NuGet | Redux state management for Blazor |
+| Microsoft.Authentication.WebAssembly.Msal | NuGet | Entra ID auth in WASM |
+| Microsoft.EntityFrameworkCore.Sqlite | NuGet | EF Core data access for SQLite WASM |
+| Microsoft.CognitiveServices.Speech | NPM (JS SDK) | Azure STT/TTS — loaded via JS interop |
+| @sqlite.org/sqlite-wasm | NPM | SQLite WASM with OPFS backend |
+
+---
+
+## 12. Configuration & Environment
+
+```json
+// appsettings.json (Redhawk.Client)
+{
+  "AzureAd": {
+    "Authority": "https://login.microsoftonline.com/{tenantId}",
+    "ClientId": "{client-id}",
+    "ValidateAuthority": true
+  },
+  "Foundry": {
+    "Endpoint": "https://{foundry-endpoint}.azureml.ms/...",
+    "ApiKey": ""
+  },
+  "Speech": {
+    "SubscriptionKey": "",
+    "Region": "eastus"
+  },
+  "Api": {
+    "BaseUrl": "https://redhawk-api.azurewebsites.net"
+  }
+}
+```
+
+---
+
+*Redhawk — AI Agent Build Specification v1.0 — Proof of Concept Scope*

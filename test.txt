@@ -1,0 +1,147 @@
+Yes — a few things make a significant difference specifically for large document analysis in VS Code.
+
+---
+
+## 1. Use the Right Extension
+
+If you have access to both Copilot and a Claude extension, **use Claude for the BRD analysis work specifically**. Claude has a larger effective context window and handles long structured documents (tables, spreadsheets, dense conditional logic) significantly better than Copilot's default models. Copilot is better suited for the code generation side of the pipeline — writing the EF Core models, the Foundry nodes, the validator code.
+
+The practical split:
+- **Claude in VS Code** → BRD analysis, structure discovery, dependency mapping
+- **Copilot** → writing the C# extraction pipeline code once you know what to build
+
+---
+
+## 2. Pre-Process the Spreadsheet Before Pasting
+
+Raw Excel copy-paste into a chat window is noisy. Do a quick pre-processing step first:
+
+**Export to CSV** — removes formatting, merged cells, and hidden columns that confuse the AI. A clean CSV is dramatically easier for the model to parse than a tab-separated Excel paste.
+
+**Strip empty rows and columns** — Excel BRDs often have large swaths of whitespace used for visual spacing. Remove them. Every token counts.
+
+**Add explicit row numbers** — prefix each row with its original row number before you paste. This is the single most useful thing you can do:
+
+```
+Row 12: Age >= 18, Age <= 65, All products, IsAdult eligibility rule
+Row 13: TobaccoUse == Yes, TermLife only, Triggers tobacco section Q13-Q18
+```
+
+When the AI references "Row 12" in its output, you can trace it back to the source instantly. This also feeds directly into your human review UI — the source cell reference is already embedded in the extraction.
+
+**Rename cryptic column headers** — if your BRD has headers like "Col_D" or "Flag1", rename them to something meaningful before processing. The AI's extraction quality is directly tied to how well it understands what each column represents.
+
+---
+
+## 3. Use a Workspace System Prompt
+
+VS Code Copilot and most Claude extensions support a persistent system prompt or instructions file. Use it to front-load domain context so you don't have to re-explain it every conversation:
+
+Create `.github/copilot-instructions.md` (for Copilot) or the equivalent instructions file for your Claude extension:
+
+```markdown
+# Redhawk BRD Analysis Context
+
+## Domain
+Life insurance application underwriting rules for a Blazor WASM PWA.
+
+## Target Output Format
+Rules must be compatible with Microsoft RulesEngine JSON format.
+Questions must match this Question schema: [paste your Question class here]
+
+## Known Field Paths
+applicant.firstName, applicant.dateOfBirth, applicant.tobaccoUse,
+applicant.occupation, applicant.annualIncome, coverage.requestedAmount
+[etc — paste your full state document field list]
+
+## Product Types
+TermLife, WholeLife [add others]
+
+## Key Terms
+- "Skip to" means NavigationRule should exclude intervening questions
+- "Section X" refers to a named question group in the question graph
+- "Flag" means a boolean field in the state document
+```
+
+This context gets included in every prompt automatically. You stop losing tokens re-explaining your schema on every conversation turn.
+
+---
+
+## 4. Work in Stages, One File Per Stage
+
+Rather than one long chat conversation, create **separate markdown files** for each pipeline stage and use them as working documents:
+
+```
+/brd-analysis/
+  01-structure-discovery.md    ← paste AI output here, iterate
+  02-dependency-map.md         ← dependency graph output
+  03-clusters.md               ← identified clusters
+  04-cluster-a-extraction.md   ← rules JSON for cluster A
+  04-cluster-b-extraction.md   ← rules JSON for cluster B
+  05-stitching-issues.md       ← cross-reference problems found
+```
+
+Opening a previous stage's output file gives the AI full context of what was already decided. You can say "given the dependency map in 02-dependency-map.md, extract rules for cluster B" and it has the prior work as grounding.
+
+This also means if an extraction goes wrong on cluster C, you don't lose clusters A and B — you just rerun that one file.
+
+---
+
+## 5. Chunk Strategically, Not by Size
+
+When the BRD is too large to paste at once, resist the urge to chunk by row count. Instead chunk by the clusters you identified in Stage 2. If you haven't done Stage 2 yet, a reasonable heuristic is to chunk by **section heading or question group header** — these are usually the natural dependency boundaries anyway.
+
+When you do paste a chunk, always prepend the **foundation context** — the globally shared fields and conditions the AI needs to correctly interpret references in that chunk:
+
+```
+FOUNDATION CONTEXT — include these fields in all rule expressions:
+applicant.age, applicant.stateOfResidence, applicant.tobaccoUse ...
+
+PREVIOUSLY EXTRACTED FIELDS (available as upstream dependencies):
+basicEligibility.isEligible (boolean)
+applicant.occupationRiskScore (integer, 1-10)
+
+NOW EXTRACT RULES FROM THIS SECTION ONLY:
+[paste chunk]
+```
+
+---
+
+## 6. Ask for Confidence Scores and Source References Explicitly
+
+Add this to every extraction prompt:
+
+```
+For each rule or question extracted, include:
+- confidence: high | medium | low
+- sourceRows: the original row numbers this was derived from
+- ambiguities: any conditions that were unclear or required inference
+```
+
+Low confidence items get flagged for human review. Source rows feed your review UI. Ambiguities give your compliance team exactly what to look at rather than reviewing everything.
+
+---
+
+## The Practical Session Flow
+
+Putting it together, a productive VS Code session on the BRD looks like:
+
+```
+Session 1 (half day):
+  Pre-process BRD → CSV with row numbers
+  Run Structure Discovery prompt → save to 01-structure-discovery.md
+  Review output, correct any misunderstandings
+  Run Dependency Mapping prompt → save to 02-dependency-map.md
+
+Session 2 (half day):
+  Identify clusters from dependency map → save to 03-clusters.md
+  Extract Cluster A (foundation/basic eligibility) → validate carefully
+  This is your highest-stakes cluster — everything depends on it
+
+Session 3+:
+  Extract remaining clusters in dependency order
+  Run stitching validation after each cluster
+  Flag ambiguities for compliance review
+```
+
+The pre-processing step in point 2 is the highest-leverage thing you can do before starting — clean input produces dramatically cleaner output. How large is the BRD roughly, do you know? Number of rows or sheets gives a sense of how aggressive the chunking strategy needs to be.
